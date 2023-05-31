@@ -74,7 +74,7 @@ class FastTextEmbeddingBag(EmbeddingBag):
 
 
 def scheck(n: str, v: Tensor, b: Tensor = None) -> None:
-    return
+    # return
     if v.isnan().any():
         print(f"{n}:", v)
         if b is not None:
@@ -291,13 +291,14 @@ print("Loading data, DONE.")
 tokenizer = get_tokenizer('basic_english')
 
 print("Building vocabulary if not exist ...")
-if os.path.exists("models/vocab.pt"):
-    vocab = torch.load("models/vocab.pt", map_location="cpu")
+if os.path.exists("transformer-LM/large_lm/models/vocab.pt"):
+    vocab = torch.load(
+        "transformer-LM/large_lm/models/vocab.pt", map_location="cpu")
 else:
     vocab = build_vocab_from_iterator(
         map(tokenizer, datapipe), min_freq=7, max_tokens=200000, specials=['<unk>'])
     vocab.set_default_index(vocab['<unk>'])
-    torch.save(vocab, "models/vocab.pt")
+    torch.save(vocab, "transformer-LM/large_lm/models/vocab.pt")
 print("Building vocabulary, DONE.")
 
 total_length = len(list(datapipe))
@@ -469,7 +470,7 @@ def evaluate(model: nn.Module, eval_dl) -> float:
 
 best_val_loss = float('inf')
 epochs = 20
-best_model_params_path = "models/best_model.pt"
+best_model_params_path = "transformer-LM/large_lm/models/best_model.pt"
 
 for epoch in range(1, epochs + 1):
     epoch_start_time = time.time()
