@@ -296,7 +296,7 @@ if os.path.exists("transformer-LM/large_lm/models/vocab.pt"):
         "transformer-LM/large_lm/models/vocab.pt", map_location="cpu")
 else:
     vocab = build_vocab_from_iterator(
-        map(tokenizer, datapipe), min_freq=7, max_tokens=200000, specials=['<unk>'])
+        map(tokenizer, datapipe), min_freq=7, max_tokens=200000, specials=['<pad>', '<unk>'])
     vocab.set_default_index(vocab['<unk>'])
     torch.save(vocab, "transformer-LM/large_lm/models/vocab.pt")
 print("Building vocabulary, DONE.")
@@ -381,6 +381,10 @@ def train(model: nn.Module, epoch, best_val_loss, best_model_params_path) -> Non
         loss = criterion(output.view(-1, ntokens), target.view(-1))
         if loss.isnan().any():
             print("loss is nan")
+            print("data")
+            print("misspelled data")
+            print("target")
+            print("output")
             sys.exit(1)
         # print("loss.item()", loss.item())
         optimizer.zero_grad()
@@ -407,6 +411,7 @@ def train(model: nn.Module, epoch, best_val_loss, best_model_params_path) -> Non
         # saving after 10,000 iteration
         if batch_count % (10000) == 0 and batch_count > 0:
             val_loss = evaluate(model, valid_dl)
+            print("evaluation completed!!!!!!!!!!!!!!!!!")
             val_ppl = math.exp(val_loss)
             elapsed = time.time() - epoch_start_time
             print('-' * 89)
@@ -429,7 +434,7 @@ def train(model: nn.Module, epoch, best_val_loss, best_model_params_path) -> Non
 
 def evaluate(model: nn.Module, eval_dl) -> float:
     model.eval()
-    total_loss = 0
+    total_loss = 0.
     total_batches = 0
     with open("data.txt", 'wt', encoding='utf-8') as d, \
             open("mis_data.txt", 'wt', encoding='utf-8') as m, \
@@ -458,9 +463,15 @@ def evaluate(model: nn.Module, eval_dl) -> float:
                         d.write(str(data[i][j]) + '\n')
                         m.write(str(misspelled_data[i][j]) + '\n')
                         p.write(str(total_words[i][j]) + '\n')
-                total_loss += criterion(output.view(-1, ntokens),
-                                        target.view(-1)).item()
-
+                loss = criterion(output.view(-1, ntokens), target.view(-1))
+                if loss.isnan().any():
+                    print("loss is nan")
+                    print("data")
+                    print("misspelled data")
+                    print("target")
+                    print("output")
+                    sys.exit(1)
+                total_loss += loss.item()
         return total_loss / total_batches
 
 ######################################################################
