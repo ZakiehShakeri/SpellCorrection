@@ -1,2 +1,2 @@
 # SpellCorrection
-A  toolkit for correcting misspellings
+Suggesting corrections for misspellings
