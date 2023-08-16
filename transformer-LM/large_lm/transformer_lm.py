@@ -19,13 +19,17 @@ from torch.autograd import Variable
 from torch import dropout, nn, Tensor
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
-import torchdata.dataloader2 as dl
+import torch.multiprocessing as mp
+from torch.utils.data.distributed import DistributedSampler
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.distributed import init_process_group, destroy_process_group
 import torchdata.datapipes as dp
 from torchtext.data.utils import get_tokenizer
 from torchtext.vocab import build_vocab_from_iterator
 
 
 epsilon = 1e-5
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 
 def load_moe(moe_path):
@@ -41,6 +45,27 @@ def load_moe(moe_path):
 
 def misspelled_sentence(sentence):
     return [choice(misspelled_sentence.moe[w]) if w in misspelled_sentence.moe and random() < 0.2 else w for w in sentence]
+
+
+def ddp_setup(rank, world_size):
+    os.environ["MASTER_ADDR"] = "localhost"
+    os.environ["MASTER_PORT"] = "12355"
+    init_process_group(backend="nccl", rank=rank, world_size=world_size)
+    torch.cuda.set_device(rank)
+
+
+def prepare_target_data(data, vocab):
+    max_len = max(len(s) for s in data)
+    data = [torch.LongTensor(vocab(s)) for s in data]
+    result = torch.cat([torch.cat((item, torch.zeros(
+        max_len - len(item), dtype=torch.long)), dim=0).unsqueeze(0) for item in data], dim=0).to(device)
+    return result
+
+
+def prepare_data(raw_text_iter, tokenizer) -> Tensor:
+    result = [tokenizer(item) for item in raw_text_iter if item.strip()]
+    result = [e for e in result if e]
+    return result
 
 # ############## class definitions ##################################
 
@@ -264,119 +289,24 @@ class PositionalEncoding(nn.Module):
         x = x + self.pe[:, :x.size(1), :]
         return self.dropout(x)
 
-# ############################# main ###################################
-
-
-parser = argparse.ArgumentParser(description='')
-parser.add_argument('--moe-path', type=str, default='',
-                    help='path to MOE model')
-parser.add_argument('--data', type=str, default='',
-                    help='path to original file for training, validating and testing the LM')
-parser.add_argument('--fasttext-path', type=str,
-                    default='', help='path to fasttext model')
-
-args = parser.parse_args()
-moe_model_path = args.moe_path
-source = args.data
-fasttext_model_path = args.fasttext_path
-
-print("Loading data ...")
-
-datapipe = dp.iter.FileOpener(
-    [source], mode='rt', encoding='utf-8')
-datapipe = datapipe.readlines(strip_newline=False, return_path=False).shuffle(
-).set_shuffle(False).sharding_filter()
-print("Loading data, DONE.")
-
-tokenizer = get_tokenizer('basic_english')
-
-print("Building vocabulary if not exist ...")
-if os.path.exists("transformer-LM/large_lm/models/vocab.pt"):
-    vocab = torch.load(
-        "transformer-LM/large_lm/models/vocab.pt", map_location="cpu")
-else:
-    vocab = build_vocab_from_iterator(
-        map(tokenizer, datapipe), min_freq=7, max_tokens=200000, specials=['<pad>', '<unk>'])
-    vocab.set_default_index(vocab['<unk>'])
-    torch.save(vocab, "transformer-LM/large_lm/models/vocab.pt")
-print("Building vocabulary, DONE.")
-
-total_length = len(list(datapipe))
-
-train_iter, valid_iter, test_iter = datapipe.random_split(
-    total_length=total_length, weights={"train": 0.8, "valid": 0.1, "test": 0.1}, seed=0)
-
-
-# TODO multiprocessing and distributing features should be added!
-# mp_rs = dl.MultiProcessingReadingService(num_workers=4)
-# dist_rs = dl.DistributedReadingService()
-# rs = dl.SequentialReadingService(dist_rs, mp_rs)
-# train_dl = dl.DataLoader2(train_iter, reading_service=rs)
-# valid_dl = dl.DataLoader2(valid_iter, reading_service=rs)
-# test_dl = dl.DataLoader2(test_iter, reading_service=rs)
-
-train_dl = DataLoader(train_iter, batch_size=20, num_workers=4)
-valid_dl = DataLoader(valid_iter, batch_size=10, num_workers=4)
-test_dl = DataLoader(test_iter, batch_size=10, num_workers=4)
-
-print("Loading MOE ...")
-misspelled_sentence.moe = load_moe(moe_model_path)
-print("Loading MOE, DONE.")
-
-
-def prepare_target_data(data):
-    max_len = max(len(s) for s in data)
-    data = [torch.LongTensor(vocab(s)) for s in data]
-    result = torch.cat([torch.cat((item, torch.zeros(
-        max_len - len(item), dtype=torch.long)), dim=0).unsqueeze(0) for item in data], dim=0).to(device)
-    return result
-
-
-def prepare_data(raw_text_iter) -> Tensor:
-    result = [tokenizer(item) for item in raw_text_iter if item.strip()]
-    result = [e for e in result if e]
-    return result
-
-
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
-batch_size = 20
-num_batch = math.ceil(total_length / batch_size)
-eval_batch_size = 10
-
-#  The model hyperparameters are defined below. The vocab size is
-# equal to the length of the vocab object.
-
-ntokens = len(vocab)
-fasttext_model_path = args.fasttext_path
-nlayers = 2
-nhead = 2
-dropout = 0.2
-model = TransformerModel(ntokens, fasttext_model_path,
-                         nhead, nlayers, dropout).to(device)
 
 #################################################################
 # Run the model
 
-criterion = nn.CrossEntropyLoss(ignore_index=0, reduction='mean')
-lr = 1
-optimizer = torch.optim.SGD(model.parameters(), lr=lr)
-scheduler = torch.optim.lr_scheduler.StepLR(optimizer, 1.0, gamma=0.95)
 
-
-def train(model: nn.Module, epoch, best_val_loss, best_model_params_path) -> None:
+def train(model: nn.Module, epoch, best_val_loss, best_model_params_path, train_dl, optimizer, scheduler, criterion, ntokens, num_batch, tokenizer, vocab) -> None:
     model.train()
     total_loss = 0.
     log_interval = 50
     total_batch = 0
     batch_count = 0
     start_time = time.time()
-
+    train_dl.sampler.set_epoch(epoch)
     for batch in iter(train_dl):
         batch_count += 1
-        data = prepare_data(batch)
+        data = prepare_data(batch, tokenizer)
         misspelled_data = [misspelled_sentence(s) for s in data]
-        target = prepare_target_data(data)
+        target = prepare_target_data(data, vocab)
         output = model(misspelled_data, target != 0)
         loss = criterion(output.view(-1, ntokens), target.view(-1))
         if loss.isnan().any():
@@ -396,7 +326,7 @@ def train(model: nn.Module, epoch, best_val_loss, best_model_params_path) -> Non
         total_batch += 1
 
         # Reporting after log_interval=50 iterations
-        if batch_count % log_interval == 0 and batch_count > 0:
+        if batch_count % log_interval == 0:
             lr = scheduler.get_last_lr()[0]
             ms_per_batch = (time.time() - start_time) * 1000 / log_interval
             cur_loss = total_loss / total_batch
@@ -407,108 +337,101 @@ def train(model: nn.Module, epoch, best_val_loss, best_model_params_path) -> Non
             total_loss = 0
             total_batch = 0
             start_time = time.time()
-
-        # saving after 10,000 iteration
-        if batch_count % (10000) == 0 and batch_count > 0:
-            val_loss = evaluate(model, valid_dl)
-            print("evaluation completed!!!!!!!!!!!!!!!!!")
-            val_ppl = math.exp(val_loss)
-            elapsed = time.time() - epoch_start_time
-            print('-' * 89)
-            print(f'| end of iter {batch_count:3d} | time: {elapsed:5.2f}s | '
-                  f'valid loss {val_loss:5.2f} | valid ppl {val_ppl:8.2f}')
-            print('-' * 89)
-
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss
-                torch.save(model.state_dict(), best_model_params_path)
-        model.train()
         del data
         del misspelled_data
         del target
         del output
         del loss
         gc.collect()
-        # print(torch.cuda.memory_summary(device=device))
 
 
-def evaluate(model: nn.Module, eval_dl) -> float:
-    model.eval()
-    total_loss = 0.
-    total_batches = 0
-    with open("data.txt", 'wt', encoding='utf-8') as d, \
-            open("mis_data.txt", 'wt', encoding='utf-8') as m, \
-            open("predicted.txt", 'wt', encoding='utf-8') as p:
-        with torch.no_grad():
-            for batch in iter(eval_dl):
-                data = prepare_data(batch)
-                total_batches += 1
-                misspelled_data = [misspelled_sentence(s) for s in data]
-
-                differences = [[index for index, (w0, w1) in enumerate(
-                    zip(s0, s1)) if w0 != w1] for s0, s1 in zip(data, misspelled_data)]
-                target = prepare_target_data(data)
-                output = model(misspelled_data, target != 0)
-                # predicted_indices = torch.argmax(output, dim=-1)
-                (_, predicted_indices) = torch.topk(output, 10, dim=-1)
-                total_words = []
-
-                # writing some data to files for quality check: original word, misspelled_word and the modification proposed by model
-                for sentence in predicted_indices:
-                    total_words.append([vocab.lookup_tokens(sentence[i].tolist())
-                                        for i in range(len(sentence))])
-
-                for i in range(len(data)):
-                    for j in differences[i]:
-                        d.write(str(data[i][j]) + '\n')
-                        m.write(str(misspelled_data[i][j]) + '\n')
-                        p.write(str(total_words[i][j]) + '\n')
-                loss = criterion(output.view(-1, ntokens), target.view(-1))
-                if loss.isnan().any():
-                    print("loss is nan")
-                    print("data")
-                    print("misspelled data")
-                    print("target")
-                    print("output")
-                    sys.exit(1)
-                total_loss += loss.item()
-        return total_loss / total_batches
-
-######################################################################
-# Loop over epochs. Save the model if the validation loss is the best
-# we've seen so far. Adjust the learning rate after each epoch.
+vocab = None
 
 
-best_val_loss = float('inf')
-epochs = 20
-best_model_params_path = "transformer-LM/large_lm/models/best_model.pt"
+def main(rank: int, world_size: int, moe_path: str, data_path: str, fasttext_path: str, total_length):
+    global device
+    global vocab
 
-for epoch in range(1, epochs + 1):
-    epoch_start_time = time.time()
-    train(model, epoch, best_val_loss, best_model_params_path)
-    val_loss = evaluate(model, valid_dl)
-    val_ppl = math.exp(val_loss)
-    elapsed = time.time() - epoch_start_time
-    print('-' * 89)
-    print(f'| end of epoch {epoch:3d} | time: {elapsed:5.2f}s | '
-          f'valid loss {val_loss:5.2f} | valid ppl {val_ppl:8.2f}')
-    print('-' * 89)
+    ddp_setup(rank, world_size)
+    device = torch.device(f"cuda:{rank}")
 
-    if val_loss < best_val_loss:
-        best_val_loss = val_loss
-        torch.save(model.state_dict(), best_model_params_path)
+    ntokens = len(vocab)
+    nlayers = 2
+    nhead = 2
+    dropout = 0.2
+    model = DDP(TransformerModel(ntokens, fasttext_path,
+                                 nhead, nlayers, dropout).to(device), device_ids=[device])
 
-    scheduler.step()
+    criterion = nn.CrossEntropyLoss(ignore_index=0, reduction='mean')
+    lr = 1
+    optimizer = torch.optim.SGD(model.parameters(), lr=lr)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, 1.0, gamma=0.95)
+
+    batch_size = 20
+    num_batch = math.ceil(total_length / batch_size)
+
+    train_dl = DataLoader(train_iter, batch_size=20,
+                          shuffle=False, sampler=DistributedSampler(train_iter))
+    valid_dl = DataLoader(valid_iter, batch_size=10, num_workers=4)
+    test_dl = DataLoader(test_iter, batch_size=10, num_workers=4)
+
+    print("Loading MOE ...")
+    misspelled_sentence.moe = load_moe(moe_path)
+    print("Loading MOE, DONE.")
+
+    best_val_loss = float('inf')
+    epochs = 20
+    best_model_params_path = "transformer-LM/large_lm/models/test_model.pt"
+    save_every = 2
+    for epoch in range(1, epochs + 1):
+        epoch_start_time = time.time()
+        train(model, epoch, best_val_loss, best_model_params_path,
+              train_dl, optimizer, scheduler, criterion, ntokens, num_batch, tokenizer, vocab)
+        if rank == 0 and epoch % save_every == 0:
+            ckp = model.module.state_dict()
+            torch.save(ckp, best_model_params_path)
+            print(
+                f"Epoch {epoch} | Training checkpoint saved at {best_model_params_path}")
+        scheduler.step()
+
+    destroy_process_group()
 
 
-######################################################################
-# Evaluate the best model on the test dataset
-# -------------------------------------------
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='')
+    parser.add_argument('--moe-path', type=str, default='',
+                        help='path to MOE model')
+    parser.add_argument('--data', type=str, default='',
+                        help='path to original file for training, validating and testing the LM')
+    parser.add_argument('--fasttext-path', type=str,
+                        default='', help='path to fasttext model')
 
-model.load_state_dict(torch.load(best_model_params_path))
-test_loss = evaluate(model, test_dl)
-test_ppl = math.exp(test_loss)
-print('-' * 89)
-print(f'| End of training | test loss {test_loss:5.2f} | '
-      f'test ppl {test_ppl:8.2f}')
-print('-' * 89)
+    args = parser.parse_args()
+
+    print("Loading data ...")
+    datapipe = dp.iter.FileOpener(
+        [args.data], mode='rt', encoding='utf-8')
+    datapipe = datapipe.readlines(strip_newline=False, return_path=False).shuffle(
+    ).set_shuffle(False).sharding_filter()
+    print("Loading data, DONE.")
+
+    tokenizer = get_tokenizer('basic_english')
+
+    print("Building vocabulary if not exist ...")
+    if os.path.exists("transformer-LM/large_lm/models/vocab.pt"):
+        vocab = torch.load(
+            "transformer-LM/large_lm/models/vocab.pt", map_location="cpu")
+    else:
+        vocab = build_vocab_from_iterator(
+            map(tokenizer, datapipe), min_freq=7, max_tokens=200000, specials=['<pad>', '<unk>'])
+        vocab.set_default_index(vocab['<unk>'])
+        torch.save(vocab, "transformer-LM/large_lm/models/vocab.pt")
+    print("Building vocabulary, DONE.")
+    total_length = len(list(datapipe))
+
+    train_iter, valid_iter, test_iter = datapipe.random_split(
+        total_length=total_length, weights={"train": 0.8, "valid": 0.1, "test": 0.1}, seed=0)
+
+    world_size = torch.cuda.device_count()
+    mp.spawn(main, args=(world_size, args.moe_path, args.data,
+             args.fasttext_path, total_length), nprocs=world_size)
